@@ -1,0 +1,233 @@
+import argparse
+import importlib.util
+import itertools
+import json
+import os
+import shutil
+from pathlib import Path
+from typing import Any, Dict, Iterable, List
+
+import pandas as pd
+
+
+def load_module_from_path(module_path: str):
+    module_path = os.path.abspath(module_path)
+    spec = importlib.util.spec_from_file_location("user_nli_module", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load module from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def expand_grid(grid: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
+    keys = list(grid.keys())
+    value_lists = [grid[k] for k in keys]
+    configs = []
+    for values in itertools.product(*value_lists):
+        configs.append(dict(zip(keys, values)))
+    return configs
+
+
+def default_search_grid() -> Dict[str, List[Any]]:
+    return {
+        "lr": [1e-3, 3e-4],
+        "dropout": [0.0],
+        "hidden_dim": [128],
+        "embed_dim": [200],
+        "mlp_dim": [256],
+        "num_layers": [1],
+        "weight_decay": [1e-4, 5e-4],
+        "min_freq": [2, 3],
+        "batch_size": [64],
+        "max_len": [128],
+        "patience": [3],
+        "epochs": [15],
+        "seed": [42],
+    }
+
+
+def load_grid(grid_json_path: str | None) -> Dict[str, List[Any]]:
+    if grid_json_path is None:
+        return default_search_grid()
+    with open(grid_json_path, "r", encoding="utf-8") as f:
+        grid = json.load(f)
+    if not isinstance(grid, dict):
+        raise ValueError("Grid JSON must be an object mapping parameter names to lists of values.")
+    for k, v in grid.items():
+        if not isinstance(v, list) or len(v) == 0:
+            raise ValueError(f"Grid entry for '{k}' must be a non-empty list.")
+    return grid
+
+
+def best_row_from_history(history_csv: str) -> Dict[str, Any]:
+    df = pd.read_csv(history_csv)
+    if df.empty:
+        raise ValueError(f"No rows found in {history_csv}")
+
+    df = df.sort_values(
+        by=["dev_macro_f1", "dev_accuracy", "dev_loss", "epoch"],
+        ascending=[False, False, True, True],
+    )
+    return df.iloc[0].to_dict()
+
+
+def build_train_config(module, train_csv: str, dev_csv: str, output_dir: str, params: Dict[str, Any]):
+    base_kwargs = {
+        "train_csv": train_csv,
+        "dev_csv": dev_csv,
+        "output_dir": output_dir,
+    }
+    base_kwargs.update(params)
+    return module.TrainConfig(**base_kwargs)
+
+
+def copy_best_artifacts(trial_dir: Path, final_dir: Path, row: Dict[str, Any], params: Dict[str, Any]) -> None:
+    final_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_src = trial_dir / "best_model.pt"
+    history_src = trial_dir / "training_history.csv"
+
+    if checkpoint_src.exists():
+        shutil.copy2(checkpoint_src, final_dir / "best_model.pt")
+    if history_src.exists():
+        shutil.copy2(history_src, final_dir / "training_history.csv")
+
+    with open(final_dir / "best_config.json", "w", encoding="utf-8") as f:
+        json.dump(params, f, indent=2)
+
+    with open(final_dir / "best_result.json", "w", encoding="utf-8") as f:
+        json.dump(row, f, indent=2)
+
+
+def run_search(args):
+    module = load_module_from_path(args.model_script)
+    grid = load_grid(args.grid_json)
+    configs = expand_grid(grid)
+
+    if args.max_trials is not None:
+        configs = configs[: args.max_trials]
+
+    search_root = Path(args.output_dir)
+    trials_root = search_root / "trials"
+    trials_root.mkdir(parents=True, exist_ok=True)
+
+    results: List[Dict[str, Any]] = []
+    best_overall: Dict[str, Any] | None = None
+    best_params: Dict[str, Any] | None = None
+    best_trial_dir: Path | None = None
+
+    for i, params in enumerate(configs, start=1):
+        trial_name = f"trial_{i:03d}"
+        trial_dir = trials_root / trial_name
+        trial_dir.mkdir(parents=True, exist_ok=True)
+
+        print("=" * 80)
+        print(f"[{i}/{len(configs)}] Training {trial_name}")
+        print(json.dumps(params, indent=2))
+
+        cfg = build_train_config(
+            module=module,
+            train_csv=args.train_csv,
+            dev_csv=args.dev_csv,
+            output_dir=str(trial_dir),
+            params=params,
+        )
+
+        module.train_model(cfg)
+
+        history_csv = trial_dir / "training_history.csv"
+        if not history_csv.exists():
+            raise FileNotFoundError(f"Expected history file was not created: {history_csv}")
+
+        best_row = best_row_from_history(str(history_csv))
+        result_row = {
+            "trial": trial_name,
+            **params,
+            **best_row,
+        }
+        results.append(result_row)
+
+        print("Best row for this trial:")
+        print(json.dumps(result_row, indent=2, default=str))
+
+        if best_overall is None:
+            best_overall = result_row
+            best_params = params
+            best_trial_dir = trial_dir
+        else:
+            current_key = (
+                result_row["dev_macro_f1"],
+                result_row.get("dev_accuracy", float("-inf")),
+                -result_row.get("dev_loss", float("inf")),
+                -result_row.get("epoch", float("inf")),
+            )
+            best_key = (
+                best_overall["dev_macro_f1"],
+                best_overall.get("dev_accuracy", float("-inf")),
+                -best_overall.get("dev_loss", float("inf")),
+                -best_overall.get("epoch", float("inf")),
+            )
+            if current_key > best_key:
+                best_overall = result_row
+                best_params = params
+                best_trial_dir = trial_dir
+
+        pd.DataFrame(results).sort_values(
+            by=["dev_macro_f1", "dev_accuracy", "dev_loss", "epoch"],
+            ascending=[False, False, True, True],
+        ).to_csv(search_root / "search_results.csv", index=False)
+
+    assert best_overall is not None and best_params is not None and best_trial_dir is not None
+
+    best_dir = search_root / "best_overall"
+    copy_best_artifacts(best_trial_dir, best_dir, best_overall, best_params)
+
+    with open(search_root / "search_summary.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "num_trials": len(results),
+                "best_trial": best_overall,
+                "best_config": best_params,
+                "best_trial_dir": str(best_trial_dir),
+                "best_export_dir": str(best_dir),
+            },
+            f,
+            indent=2,
+        )
+
+    print("=" * 80)
+    print("Search complete.")
+    print(f"Best trial: {best_overall['trial']}")
+    print(f"Best dev macro-F1: {best_overall['dev_macro_f1']:.6f}")
+    print(f"Best checkpoint copied to: {best_dir / 'best_model.pt'}")
+    print(f"Results table saved to: {search_root / 'search_results.csv'}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Grid-search wrapper for your NLI training script."
+    )
+    parser.add_argument("--model_script", type=str, default="nli.py",
+                        help="Path to the training script to search over, e.g. nli.py")
+    parser.add_argument("--train_csv", type=str, required=True)
+    parser.add_argument("--dev_csv", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, default="runs/hparam_search")
+    parser.add_argument(
+        "--grid_json",
+        type=str,
+        default=None,
+        help="Optional JSON file describing the search grid. If omitted, a built-in grid is used.",
+    )
+    parser.add_argument(
+        "--max_trials",
+        type=int,
+        default=None,
+        help="Optional cap on number of trial configs to run.",
+    )
+    args = parser.parse_args()
+    run_search(args)
+
+
+if __name__ == "__main__":
+    main()
